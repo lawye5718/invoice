@@ -41,47 +41,154 @@ def extract_zip_with_encoding(zip_path, extract_to):
 def normalize_text(text):
     """文本清洗"""
     if not text: return ""
+    # 替换常见干扰字符，统一标点
     return text.replace(" ", "").replace("\n", "").replace("\r", "")\
                .replace("：", ":").replace("￥", "¥")\
                .replace("（", "(").replace("）", ")")\
-               .replace("O", "0")
+               .replace("O", "0").replace("o", "0")
 
 def format_date(date_str):
     """统一日期格式 YYYY-MM-DD"""
     if not date_str: return ""
-    # 提取年-月-日
     m = re.search(r'(\d{4})[-年/.](\d{1,2})[-月/.](\d{1,2})', date_str)
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
     return ""
 
-def find_best_amount(text):
-    """双重策略提取金额"""
-    if not text: return 0.0
-    # 策略A: 锚点查找
-    anchor_pattern = r'(?:小写|¥|￥|合计|金额)[^0-9\.]*([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})'
-    for m in re.findall(anchor_pattern, text):
+# ==========================================
+# 2. 金额处理核心引擎 (新增大写解析)
+# ==========================================
+
+def cn_upper_to_float(cn_str):
+    """
+    将中文大写金额转换为浮点数
+    例如：贰佰捌拾叁圆捌角壹分 -> 283.81
+    """
+    if not cn_str: return 0.0
+    
+    # 映射表
+    CN_NUM = {'零': 0, '壹': 1, '贰': 2, '叁': 3, '肆': 4, '伍': 5, '陆': 6, '柒': 7, '捌': 8, '玖': 9,
+              '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '两': 2}
+    CN_UNIT = {'拾': 10, '十': 10, '佰': 100, '百': 100, '仟': 1000, '千': 1000, '万': 10000, '亿': 100000000}
+    
+    # 清洗：去掉"整"、"正"、"圆"、"元"等
+    # 但要注意"圆"是分界线
+    
+    # 简单解析逻辑：
+    # 1. 按"圆/元"分割整数和小数
+    parts = re.split(r'[圆元]', cn_str)
+    integer_str = parts[0]
+    decimal_str = parts[1] if len(parts) > 1 else ""
+    
+    # --- 解析整数部分 ---
+    def parse_section(s):
+        val = 0
+        curr_digit = 0
+        unit_val = 0
+        
+        for char in s:
+            if char in CN_NUM:
+                curr_digit = CN_NUM[char]
+            elif char in CN_UNIT:
+                if char in ['万', '亿']:
+                    # 遇到万/亿，结算前面的所有
+                    val = (val + unit_val + curr_digit) * CN_UNIT[char]
+                    unit_val = 0
+                    curr_digit = 0
+                else:
+                    unit_val += curr_digit * CN_UNIT[char]
+                    curr_digit = 0
+            # 零忽略
+        return val + unit_val + curr_digit
+
+    total = parse_section(integer_str)
+    
+    # --- 解析小数部分 (角、分) ---
+    decimal_val = 0.0
+    curr_digit = 0
+    for char in decimal_str:
+        if char in CN_NUM:
+            curr_digit = CN_NUM[char]
+        elif char == '角':
+            decimal_val += curr_digit * 0.1
+            curr_digit = 0
+        elif char == '分':
+            decimal_val += curr_digit * 0.01
+            curr_digit = 0
+            
+    return round(total + decimal_val, 2)
+
+def find_amount_strict(text):
+    """
+    严格金额提取策略：
+    1. 优先提取大写金额 (Authoritative)
+    2. 提取小写金额 (Verify)
+    3. 返回 (最佳金额, 备注信息)
+    """
+    if not text: return 0.0, "空白内容"
+    
+    # --- 1. 提取大写金额 ---
+    # 匹配模式：价税合计(大写) XXXXX
+    # 兼容：大写:、大写：
+    upper_pattern = r'(?:价税合计|大写|金额).*?([零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆角分整]+)'
+    upper_match = re.search(upper_pattern, text)
+    
+    amount_upper = 0.0
+    has_upper = False
+    
+    if upper_match:
+        cn_str = upper_match.group(1)
+        # 排除短杂音（例如只匹配到一个"圆"字）
+        if len(cn_str) > 1:
+            try:
+                amount_upper = cn_upper_to_float(cn_str)
+                if amount_upper > 0:
+                    has_upper = True
+            except: pass
+
+    # --- 2. 提取小写金额 ---
+    # 匹配模式：(小写)、¥、￥ 紧跟的数字
+    # 严格模式：不再全屏搜索最大数字，防止匹配到单价
+    lower_pattern = r'(?:小写|¥|￥|合计)[^0-9\.]*([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})'
+    lower_matches = re.findall(lower_pattern, text)
+    
+    amount_lower = 0.0
+    has_lower = False
+    
+    # 取第一个匹配到的有效金额 (通常发票小写就在大写后面)
+    for m in lower_matches:
         try:
             val = float(m.replace(",", ""))
-            if 0.01 <= val <= 5000000: return val
+            if 0.01 <= val <= 5000000:
+                amount_lower = val
+                has_lower = True
+                break # 找到即止
         except: continue
 
-    # 策略B: 最大值
-    matches = re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', text)
-    valid = []
-    for m in matches:
-        try:
-            val = float(m.replace(",", ""))
-            if 0.01 <= val <= 5000000 and val not in [0.06, 0.03, 0.13, 0.01, 1.00]:
-                valid.append(val)
-        except: continue
-    return max(valid) if valid else 0.0
+    # --- 3. 决策与校验 ---
+    
+    # 情况A: 有大写 (以大写为准)
+    if has_upper:
+        if has_lower:
+            if abs(amount_upper - amount_lower) > 0.1:
+                return amount_upper, f"⚠️ 大小写不符 (大写:{amount_upper} 小写:{amount_lower})"
+            else:
+                return amount_upper, "正常" # 校验通过
+        else:
+            return amount_upper, "正常 (无小写)"
+
+    # 情况B: 无大写，有小写 (降级使用小写)
+    if has_lower:
+        return amount_lower, "使用小写 (未读到大写)"
+        
+    # 情况C: 都没有
+    return 0.0, "警告:未读到金额"
 
 def extract_seller_name_smart(text):
     """提取销售方"""
     suffix = r"[\u4e00-\u9fa5()（）]{2,30}(?:公司|事务所|酒店|旅行社|经营部|服务部|分行|支行|馆|店|处|中心)"
     candidates = list(set(re.findall(suffix, text)))
-    blacklist = ["税务局", "财政部", "购买方", "开户行", "银行", "地址", "电话", "统一社会信用", "纳税人", "适用税率", "密码区"]
+    blacklist = ["税务局", "财政部", "购买方", "开户行", "银行", "地址", "电话", "统一社会信用", "纳税人", "适用税率", "密码区", "机器编号"]
     filtered = [c for c in candidates if not any(b in c for b in blacklist) and len(c) >= 4]
     return max(filtered, key=len) if filtered else ""
 
@@ -97,7 +204,7 @@ def is_trip_file(filename, text=None):
     return False
 
 # ==========================================
-# 2. 解析函数 (增强版)
+# 3. 解析函数 (XML & PDF)
 # ==========================================
 
 def parse_xml_invoice_data(xml_path):
@@ -111,6 +218,8 @@ def parse_xml_invoice_data(xml_path):
         num = g(".//TaxSupervisionInfo/InvoiceNumber") or g(".//InvoiceNumber") or g(".//Fphm")
         date = g(".//TaxSupervisionInfo/IssueTime") or g(".//IssueTime") or g(".//Kprq")
         seller = g(".//SellerInformation/SellerName") or g(".//Xfmc")
+        
+        # XML 中的金额通常是数字，直接读取
         amt_str = g(".//BasicInformation/TotalTax-includedAmount") or g(".//TotalTax-includedAmount") or g(".//TotalAmount") or g(".//Jshj")
         amount = float(amt_str.replace(',', '')) if amt_str else 0.0
 
@@ -125,7 +234,11 @@ def extract_data_from_pdf_simple(pdf_path):
         with pdfplumber.open(pdf_path) as p:
             if not p.pages: return None
             raw = p.pages[0].extract_text()
-            if not raw or len(raw.strip()) < 10: return None # 纯图忽略
+            if not raw or len(raw.strip()) < 10: 
+                return {
+                    "发票号码": "", "开票日期": "", "销售方名称": "", "价税合计": 0.0,
+                    "文件名": os.path.basename(pdf_path), "备注": "⚠️ 纯图/扫描件"
+                }
             
             text = normalize_text(raw)
             num = ""
@@ -139,98 +252,85 @@ def extract_data_from_pdf_simple(pdf_path):
             md = re.search(r'(\d{4}[-年/.]\d{1,2}[-月/.]\d{1,2}日?)', text)
             if md: date = format_date(md.group(1))
             
-            amt = find_best_amount(text)
+            # 使用严格金额提取策略
+            amt, status_note = find_amount_strict(text)
             seller = extract_seller_name_smart(text)
+            
+            # 如果没读到号但读到了金额，标注一下
+            if not num and amt > 0:
+                if "警告" not in status_note:
+                    status_note = "无发票号-" + status_note
             
             return {
                 "发票号码": num, "开票日期": date, "销售方名称": seller,
-                "价税合计": amt, "文件名": os.path.basename(pdf_path)
+                "价税合计": amt, "文件名": os.path.basename(pdf_path),
+                "备注": status_note
             }
     except: return None
 
 # ==========================================
-# 3. 核心校验引擎 (Verification Engine)
+# 4. 校验引擎 (Verifier)
 # ==========================================
 
 class InvoiceVerifier:
     def __init__(self, processed_df):
-        """
-        根据 Excel 数据建立多维索引
-        """
         self.df = processed_df
-        self.processed_nums = {}   # Num -> {Amount, Date}
-        self.processed_attrs = {}  # (Amount, Date, Seller) -> Exists
+        self.processed_nums = {} 
+        self.processed_attrs = {}
         
-        # 建立索引
         for _, row in self.df.iterrows():
-            # 1. 索引号码
             p_num = str(row.get('发票号码', '')).strip()
             p_amt = float(row.get('价税合计', 0))
             p_date = str(row.get('开票日期', '')).strip()
             p_seller = str(row.get('销售方名称', '')).strip()
             
-            if p_num and len(p_num) > 6: # 忽略太短的号码
+            if p_num and len(p_num) > 6:
                 self.processed_nums[p_num] = {'amount': p_amt, 'date': p_date}
             
-            # 2. 索引属性 (金额+日期+销售方) - 用于无号匹配
-            # 销售方只取前4个字作为模糊匹配键，防止公司名全称/简称差异
             short_seller = p_seller[:4] if len(p_seller) >=4 else p_seller
             attr_key = (f"{p_amt:.2f}", p_date, short_seller)
             self.processed_attrs[attr_key] = True
 
     def check(self, raw_info):
-        """
-        核对原始文件是否在已处理列表中
-        返回: (是否通过, 原因)
-        """
-        raw_num = str(raw_info.get('num') or '').strip()
-        raw_amt = float(raw_info.get('amount') or 0)
-        raw_date = str(raw_info.get('date') or '').strip()
-        raw_seller = str(raw_info.get('seller') or '').strip()
+        raw_num = str(raw_info.get('num') or raw_info.get('发票号码') or '').strip()
+        raw_amt = float(raw_info.get('amount') or raw_info.get('价税合计') or 0)
+        raw_date = str(raw_info.get('date') or raw_info.get('开票日期') or '').strip()
+        raw_seller = str(raw_info.get('seller') or raw_info.get('销售方名称') or '').strip()
         
-        # 1. 优先匹配发票号码 (强校验)
+        # 1. 强校验：号码 + 金额
         if raw_num and len(raw_num) > 6:
             if raw_num in self.processed_nums:
-                # 进一步核对金额 (允许 0.1 误差)
                 rec_amt = self.processed_nums[raw_num]['amount']
                 if abs(rec_amt - raw_amt) < 0.1:
-                    return True, "号码与金额完全匹配"
+                    return True
                 else:
-                    # 号码对但金额不对，依然算"已处理"，但值得注意
-                    # 在核对"遗漏"的语境下，只要Excel里有这个号，就不算遗漏
-                    return True, f"号码匹配但金额不一致 (Excel:{rec_amt} vs Raw:{raw_amt})"
+                    return True # 号码对上了就算找到，但金额不一致是另一回事
         
-        # 2. 如果没有号码或号码没匹配上，尝试"无号匹配" (兜底)
-        # 只有当金额 > 0 时才进行此匹配
+        # 2. 弱校验：金额 + 日期 + 销售方 (针对无号文件)
         if raw_amt > 0:
             short_seller = raw_seller[:4] if len(raw_seller) >=4 else raw_seller
             attr_key = (f"{raw_amt:.2f}", raw_date, short_seller)
             if attr_key in self.processed_attrs:
-                return True, "金额、日期、销售方匹配"
-                
-            # 放宽条件：只匹配 金额 + 日期 (防止销售方识别失败)
-            # 但为了防止撞车，只有当金额比较"独特"(带小数)时才敢认
+                return True
+            
+            # 3. 兜底校验：金额 + 日期 (只有当金额比较独特，即有小数位时)
             if raw_amt % 1 != 0:
                 for k in self.processed_attrs:
-                    # k = (amt_str, date, seller)
                     if k[0] == f"{raw_amt:.2f}" and k[1] == raw_date:
-                        return True, "金额与日期匹配(忽略销售方)"
+                        return True
 
-        # 3. 确实找不到
-        return False, "未找到匹配项"
+        return False
 
 # ==========================================
-# 4. 主处理流程
+# 5. 主处理流程
 # ==========================================
 
 def run_process_pipeline(input_root_dir, output_dir):
-    """处理并自动核对"""
     merged_dir = os.path.join(output_dir, 'Merged_PDFs')
     noxml_dir = os.path.join(output_dir, 'No_XML_PDFs')
     os.makedirs(merged_dir, exist_ok=True)
     os.makedirs(noxml_dir, exist_ok=True)
 
-    # 1. 扫描与池化
     all_files = []
     for root, dirs, files in os.walk(input_root_dir):
         for f in files: all_files.append(os.path.join(root, f))
@@ -246,7 +346,7 @@ def run_process_pipeline(input_root_dir, output_dir):
             with pdfplumber.open(pdf) as p:
                 if not p.pages: continue
                 text = normalize_text(p.pages[0].extract_text())
-                amt = find_best_amount(text)
+                amt, _ = find_amount_strict(text) # 使用严格模式
                 folder = os.path.dirname(pdf)
                 if is_trip_file(os.path.basename(pdf), text):
                     trip_pool.append({'path': pdf, 'amount': amt, 'folder': folder, 'used': False})
@@ -254,37 +354,37 @@ def run_process_pipeline(input_root_dir, output_dir):
                     invoice_pdf_pool.append({'path': pdf, 'amount': amt, 'folder': folder})
         except: pass
 
-    # 2. 处理流程
     excel_rows = []
     idx = 1
-    processed_files_map = set() # 仅用于去重，不用于核对
+    processed_source_files = set()
 
     # A. XML处理
     for xml in xml_files:
         info = parse_xml_invoice_data(xml)
         if not info: continue
-        processed_files_map.add(os.path.abspath(xml))
+        processed_source_files.add(os.path.abspath(xml))
         
         row = {"序号": idx, "发票号码": info['num'], "开票日期": info['date'],
-               "销售方名称": info['seller'], "价税合计": info['amount'], "数据来源": "XML", "文件名": os.path.basename(xml)}
+               "销售方名称": info['seller'], "价税合计": info['amount'], "数据来源": "XML", "文件名": os.path.basename(xml), "备注": "正常"}
         
         folder = os.path.dirname(xml)
         target_pdf = None
-        # 找PDF
         cands = [p['path'] for p in invoice_pdf_pool if p['folder'] == folder]
+        xml_base = os.path.splitext(os.path.basename(xml))[0]
+        
         for p in cands:
-            if os.path.splitext(os.path.basename(xml))[0] in os.path.basename(p) or (info['num'] and info['num'] in os.path.basename(p)):
+            if xml_base in os.path.basename(p) or (info['num'] and info['num'] in os.path.basename(p)):
                 target_pdf = p; break
         
         if target_pdf:
-            processed_files_map.add(os.path.abspath(target_pdf))
-            # 找行程单
+            processed_source_files.add(os.path.abspath(target_pdf))
             matched_trip = None
             for t in [x for x in trip_pool if x['folder'] == folder and not x['used']]:
                 if abs(t['amount'] - info['amount']) < 0.05:
                     matched_trip = t; t['used'] = True; break
             
             if matched_trip:
+                processed_source_files.add(os.path.abspath(matched_trip['path']))
                 try:
                     merger = PdfWriter()
                     merger.append(target_pdf); merger.append(matched_trip['path'])
@@ -296,7 +396,6 @@ def run_process_pipeline(input_root_dir, output_dir):
                     row['备注'] = "合并失败-保留原件"
             else:
                 shutil.copy2(target_pdf, os.path.join(noxml_dir, os.path.basename(target_pdf)))
-                row['备注'] = "正常(无行程单)"
         else:
              row['备注'] = "仅XML(缺PDF)"
         
@@ -304,11 +403,12 @@ def run_process_pipeline(input_root_dir, output_dir):
 
     # B. PDF处理
     for inv in invoice_pdf_pool:
-        if os.path.abspath(inv['path']) in processed_files_map: continue
-        data = extract_data_from_pdf_simple(inv['path'])
-        if not data: continue # 无法识别的文件暂不进表，依靠核对环节捞回
+        if os.path.abspath(inv['path']) in processed_source_files: continue
         
-        # 找行程单
+        data = extract_data_from_pdf_simple(inv['path'])
+        if not data: continue
+        processed_source_files.add(os.path.abspath(inv['path']))
+        
         matched_trip = None
         folder = inv['folder']
         for t in [x for x in trip_pool if x['folder'] == folder and not x['used']]:
@@ -316,6 +416,7 @@ def run_process_pipeline(input_root_dir, output_dir):
                 matched_trip = t; t['used'] = True; break
         
         if matched_trip:
+            processed_source_files.add(os.path.abspath(matched_trip['path']))
             try:
                 merger = PdfWriter()
                 merger.append(inv['path']); merger.append(matched_trip['path'])
@@ -329,11 +430,17 @@ def run_process_pipeline(input_root_dir, output_dir):
                 data['备注'] = "合并失败-保留原件"
         else:
             shutil.copy2(inv['path'], os.path.join(noxml_dir, os.path.basename(inv['path'])))
-            data['备注'] = "正常(无XML)"
             
         data['序号'] = idx; excel_rows.append(data); idx += 1
 
-    # C. 生成 Excel
+    # C. 行程单兜底
+    for t in trip_pool:
+        if not t['used']:
+            processed_source_files.add(os.path.abspath(t['path']))
+            try: shutil.copy2(t['path'], os.path.join(noxml_dir, os.path.basename(t['path'])))
+            except: pass
+
+    # D. 生成结果与核对
     excel_path = None
     df_result = pd.DataFrame()
     if excel_rows:
@@ -344,96 +451,57 @@ def run_process_pipeline(input_root_dir, output_dir):
         df_result = df_result[cols]
         df_result['价税合计'] = pd.to_numeric(df_result['价税合计'], errors='coerce').fillna(0.0)
         
-        # 保存用于核对
-        df_final = df_result.copy() 
-        
-        # 添加总计行 (只为了展示，核对时不包含)
         sum_row = {"序号": "总计", "价税合计": df_result['价税合计'].sum(), "销售方名称": f"共 {len(df_result)} 张"}
         df_display = pd.concat([df_result, pd.DataFrame([sum_row])], ignore_index=True)
         excel_path = os.path.join(output_dir, 'Summary_Final.xlsx')
         df_display.to_excel(excel_path, index=False)
-    
-    # 3. --- 自动核对环节 (Auto Verification) ---
+
     missing_files = []
-    
     if not df_result.empty:
-        verifier = InvoiceVerifier(df_result) # 基于结果建立索引
-        
-        # 遍历所有原始文件进行核对
+        verifier = InvoiceVerifier(df_result)
         for f in all_files:
             if not f.lower().endswith(('.pdf', '.xml')): continue
             
-            # 提取原始文件特征
-            raw_info = {}
+            raw_info = None
             try:
-                if f.lower().endswith('.xml'):
-                    raw_info = parse_xml_invoice_data(f)
-                else:
-                    # 对于PDF，如果它是被用掉的行程单，我们暂时不视为遗漏
-                    # 但为了严谨，我们检查它是否在 Excel 或被标记为行程单
-                    # 简化逻辑：尝试作为发票提取
-                    raw_info = extract_data_from_pdf_simple(f)
-                    # 如果提取失败(如扫描件)，raw_info 为 None
+                if f.lower().endswith('.xml'): raw_info = parse_xml_invoice_data(f)
+                else: raw_info = extract_data_from_pdf_simple(f)
             except: pass
             
-            # 判定逻辑
-            is_missing = False
-            
-            if not raw_info:
-                # 无法解析的文件，视为遗漏 (可能是坏文件或纯图)
-                is_missing = True
-            else:
-                # 检查是否在结果中
-                found, reason = verifier.check({
-                    'num': raw_info.get('num') or raw_info.get('发票号码'),
-                    'amount': raw_info.get('amount') or raw_info.get('价税合计'),
-                    'date': raw_info.get('date') or raw_info.get('开票日期'),
-                    'seller': raw_info.get('seller') or raw_info.get('销售方名称')
-                })
-                
-                if not found:
-                    # 如果没找到，再给一次机会：是不是行程单？
-                    # 如果是行程单，且在 Excel 备注里有 "已合并行程单" 的记录，我们很难一一对应
-                    # 所以策略是：只报告 "遗漏的发票"。行程单如果没匹配上，也是一种遗漏。
-                    # 这里直接判定为遗漏。
-                     is_missing = True
+            is_missing = True
+            if raw_info:
+                # 特殊处理：如果PDF被识别为纯图(备注含警告)，直接算遗漏
+                if "纯图" in raw_info.get('备注', ''):
+                    is_missing = True
+                elif verifier.check(raw_info):
+                    is_missing = False
             
             if is_missing:
-                # 排除掉确实是行程单且被程序内部消化的情况？
-                # 现在的逻辑更严格：只要 Excel 里找不到这个号/金额，就算遗漏。
-                # 这会把未合并的行程单也算作遗漏（这是好事，用户需要知道哪些行程单没用上）
                 missing_files.append(f)
 
     return excel_path, merged_dir, noxml_dir, missing_files
 
 # ==========================================
-# 5. 手动核对 (复用 Verifier)
+# 6. 手动核对功能
 # ==========================================
 
 def run_manual_check(raw_dir, proc_zip_path, out_dir):
-    # 1. 解压并读取 Excel
     df_proc = pd.DataFrame()
     with zipfile.ZipFile(proc_zip_path, 'r') as z:
-        # 优先找 Excel
         xls = [n for n in z.namelist() if n.endswith('.xlsx')]
         if xls:
-            with z.open(xls[0]) as f:
-                df_proc = pd.read_excel(f)
+            with z.open(xls[0]) as f: df_proc = pd.read_excel(f)
         else:
-            # 没有 Excel，回退到文件名解析 (旧逻辑兼容)
+            # 兼容旧版ZIP
             rows = []
             for n in z.namelist():
                 if n.endswith('.pdf'):
                     base = os.path.basename(n)
-                    # 尝试从文件名提取 num, amount
                     m = re.match(r'(\d+)_([\d\.]+)\.pdf', base)
-                    if m:
-                        rows.append({'发票号码': m.group(1), '价税合计': float(m.group(2))})
+                    if m: rows.append({'发票号码': m.group(1), '价税合计': float(m.group(2))})
             df_proc = pd.DataFrame(rows)
 
     verifier = InvoiceVerifier(df_proc)
-    
-    # 2. 遍历原始文件
     missing = []
     matched_count = 0
     
@@ -442,27 +510,17 @@ def run_manual_check(raw_dir, proc_zip_path, out_dir):
             if not f.lower().endswith(('.pdf', '.xml')): continue
             fp = os.path.join(root, f)
             
-            raw_info = {}
+            raw_info = None
             try:
-                if f.lower().endsWith('.xml'): raw_info = parse_xml_invoice_data(fp)
+                if f.lower().endswith('.xml'): raw_info = parse_xml_invoice_data(fp)
                 else: raw_info = extract_data_from_pdf_simple(fp)
             except: pass
             
-            if not raw_info:
+            if raw_info and verifier.check(raw_info):
+                matched_count += 1
+            else:
                 missing.append(fp)
-                continue
-                
-            found, _ = verifier.check({
-                'num': raw_info.get('num') or raw_info.get('发票号码'),
-                'amount': raw_info.get('amount') or raw_info.get('价税合计'),
-                'date': raw_info.get('date') or raw_info.get('开票日期'),
-                'seller': raw_info.get('seller') or raw_info.get('销售方名称')
-            })
-            
-            if found: matched_count += 1
-            else: missing.append(fp)
-            
-    # 打包
+    
     zip_p = None
     if missing:
         zip_p = os.path.join(out_dir, "Manual_Missing.zip")
@@ -472,22 +530,21 @@ def run_manual_check(raw_dir, proc_zip_path, out_dir):
     return matched_count, len(missing), zip_p
 
 # ==========================================
-# 6. Streamlit 主界面
+# 7. Streamlit 主界面
 # ==========================================
 
 def main():
-    st.set_page_config(page_title="发票无忧 V11 (精准核对版)", layout="wide")
-    st.title("🧾 发票无忧 V11 (高精度自动核对)")
+    st.set_page_config(page_title="发票无忧 V12 (大写金额校验版)", layout="wide")
+    st.title("🧾 发票无忧 V12 (严格金额校验)")
 
-    tab1, tab2 = st.tabs(["🚀 一键处理+核对", "🔍 手动复核"])
+    tab1, tab2 = st.tabs(["🚀 一键处理", "🔍 手动复核"])
 
-    # --- Tab 1 ---
     with tab1:
-        st.info("上传 ZIP/文件夹 -> 处理 -> 自动比对结果 -> 导出遗漏文件")
+        st.info("上传 ZIP/文件夹 -> 优先提取大写金额 -> 自动核对")
         uploaded_files = st.file_uploader("上传文件", type=['zip', 'xml', 'pdf'], accept_multiple_files=True, key="u1")
 
         if uploaded_files and st.button("开始处理", key="b1"):
-            with st.spinner('正在处理并进行全量核对...'):
+            with st.spinner('正在处理...'):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     input_root = os.path.join(temp_dir, "input")
                     os.makedirs(input_root, exist_ok=True)
@@ -504,15 +561,12 @@ def main():
                     out_dir = os.path.join(temp_dir, "output")
                     excel, merged, noxml, missing_list = run_process_pipeline(input_root, out_dir)
                     
-                    st.success("✅ 处理完成！")
+                    st.success("✅ 完成！")
                     c1, c2 = st.columns(2)
-                    
                     if excel:
                         df = pd.read_excel(excel)
-                        c1.metric("已录入发票", f"{len(df)-1} 张")
+                        c1.metric("已录入", f"{len(df)-1} 张")
                         st.dataframe(df.tail(3))
-                        
-                        # 下载结果
                         res_zip = os.path.join(temp_dir, "Result.zip")
                         with zipfile.ZipFile(res_zip, 'w', zipfile.ZIP_DEFLATED) as z:
                             z.write(excel, "汇总表.xlsx")
@@ -521,27 +575,24 @@ def main():
                             for r, _, fs in os.walk(noxml):
                                 for f in fs: z.write(os.path.join(r, f), f"独立发票/{f}")
                         with open(res_zip, "rb") as f:
-                            st.download_button("📥 下载结果包 (Result.zip)", f, "Result.zip")
+                            st.download_button("📥 下载结果 (Result.zip)", f, "Result.zip")
 
-                    # 遗漏报告
-                    c2.metric("遗漏文件 (含无效/未匹配)", f"{len(missing_list)} 个", delta_color="inverse")
+                    c2.metric("遗漏", f"{len(missing_list)} 个", delta_color="inverse")
                     if missing_list:
-                        st.error("检测到遗漏文件！(已打包，包含坏文件、扫描件或未匹配的行程单)")
                         m_zip = os.path.join(temp_dir, "Missing.zip")
                         with zipfile.ZipFile(m_zip, 'w', zipfile.ZIP_DEFLATED) as z:
                             for m in missing_list: z.write(m, f"遗漏文件/{os.path.basename(m)}")
                         with open(m_zip, "rb") as f:
                             st.download_button("📥 下载遗漏包 (Missing.zip)", f, "Missing.zip", type="primary")
 
-    # --- Tab 2 ---
     with tab2:
-        st.write("用【Excel 数据】反向核对原始文件，精度更高。")
+        st.write("反向核对：用 Excel 结果检查原始文件是否遗漏。")
         c1, c2 = st.columns(2)
-        raw_ups = c1.file_uploader("1. 上传原始发票", type=['zip','pdf'], accept_multiple_files=True, key="u2")
+        raw_ups = c1.file_uploader("1. 上传原始文件", type=['zip','pdf'], accept_multiple_files=True, key="u2")
         proc_zip = c2.file_uploader("2. 上传 Result.zip", type=['zip'], key="u3")
         
         if raw_ups and proc_zip and st.button("开始核对", key="b2"):
-            with st.spinner("正在解压比对..."):
+            with st.spinner("核对中..."):
                 with tempfile.TemporaryDirectory() as td:
                     raw_d = os.path.join(td, "raw")
                     os.makedirs(raw_d, exist_ok=True)
@@ -555,7 +606,7 @@ def main():
                     
                     match, miss, mzip = run_manual_check(raw_d, pz, td)
                     st.metric("✅ 匹配成功", match)
-                    st.metric("❌ 遗漏/未录入", miss)
+                    st.metric("❌ 遗漏", miss)
                     if mzip:
                         with open(mzip, "rb") as f:
                             st.download_button("📥 下载遗漏文件", f, "Manual_Missing.zip")

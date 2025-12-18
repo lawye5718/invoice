@@ -39,29 +39,62 @@ def extract_zip_with_encoding(zip_path, extract_to):
                     shutil.copyfileobj(source, target)
 
 def normalize_text(text):
+    """文本清洗：统一符号，去空格"""
     if not text: return ""
     return text.replace(" ", "").replace("\n", "").replace("\r", "")\
                .replace("：", ":").replace("￥", "¥")\
-               .replace("（", "(").replace("）", ")")
+               .replace("（", "(").replace("）", ")")\
+               .replace("O", "0") # 常见OCR错误修正
 
-def find_max_valid_amount(text):
-    """提取金额"""
+def format_date(date_str):
+    """统一日期格式为 YYYY-MM-DD"""
+    if not date_str: return ""
+    # 替换常见分隔符
+    clean = re.sub(r'[年/.]', '-', date_str).replace('日', '')
+    return clean
+
+# --- 🎯 核心增强：双重策略提取金额 ---
+def find_best_amount(text):
+    """
+    智能金额提取：
+    策略A (高置信度): 查找 "小写"、"¥"、"价税合计" 后紧跟的数字
+    策略B (兜底): 查找全文中最大的合规数字
+    """
+    if not text: return 0.0
+
+    # 1. 策略A: 语义锚点查找 (最准)
+    # 匹配模式: (小写|￥|¥|合计) 后面跟随着数字
+    # 例子: "小写¥100.00", "合计:100.00"
+    anchor_pattern = r'(?:小写|¥|￥|合计|金额)[^0-9\.]*([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})'
+    anchor_matches = re.findall(anchor_pattern, text)
+    
+    for m in anchor_matches:
+        try:
+            val = float(m.replace(",", ""))
+            # 简单校验
+            if 0.01 <= val <= 5000000:
+                return val
+        except: continue
+
+    # 2. 策略B: 全文搜索最大值 (兜底)
+    # 匹配所有带两位小数的数字
     matches = re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', text)
     valid_amounts = []
     for m in matches:
         try:
             val = float(m.replace(",", ""))
-            # 排除常见干扰：税率(0.06/0.13)、数量(1.00)、过小的金额
+            # 排除干扰项: 税率, 数量(1.00), 常见日期片段(20.25)
             if 0.01 <= val <= 5000000 and val not in [0.06, 0.03, 0.13, 0.01, 1.00]:
                 valid_amounts.append(val)
         except: continue
+        
     return max(valid_amounts) if valid_amounts else 0.0
 
 def extract_seller_name_smart(text):
     """提取销售方"""
     suffix_pattern = r"[\u4e00-\u9fa5()（）]{2,30}(?:公司|事务所|酒店|旅行社|经营部|服务部|分行|支行|馆|店|处|中心)"
     candidates = list(set(re.findall(suffix_pattern, text)))
-    blacklist = ["税务局", "财政部", "购买方", "开户行", "银行", "地址", "电话", "统一社会信用", "纳税人", "适用税率", "密码区"]
+    blacklist = ["税务局", "财政部", "购买方", "开户行", "银行", "地址", "电话", "统一社会信用", "纳税人", "适用税率", "密码区", "机器编号"]
     filtered = [c for c in candidates if not any(b in c for b in blacklist) and len(c) >= 4]
     return max(filtered, key=len) if filtered else ""
 
@@ -71,13 +104,14 @@ def is_trip_file(filename, text=None):
     if "行程" in fn or "trip" in fn or "报销" in fn:
         if text:
             clean = normalize_text(text)
+            # 如果内容里有明确发票特征，则不是行程单
             if "发票代码" in clean or "发票号码" in clean or "电子发票" in clean:
                 return False
         return True
     return False
 
 # ==========================================
-# 2. 解析函数
+# 2. 解析函数 (XML & PDF)
 # ==========================================
 
 def parse_xml_invoice_data(xml_path):
@@ -93,20 +127,38 @@ def parse_xml_invoice_data(xml_path):
         seller = g(".//SellerInformation/SellerName") or g(".//Xfmc")
         
         amt_str = g(".//BasicInformation/TotalTax-includedAmount") or g(".//TotalTax-includedAmount") or g(".//TotalAmount") or g(".//Jshj")
-        # 修复金额逗号问题
+        # 修复: 移除逗号防止 float 报错
         amount = float(amt_str.replace(',', '')) if amt_str else 0.0
 
-        return {"num": num, "date": date, "seller": seller, "amount": amount}
+        return {
+            "num": num, 
+            "date": format_date(date.split(' ')[0] if date else ""), # 仅取日期部分
+            "seller": seller, 
+            "amount": amount
+        }
     except: return None
 
 def extract_data_from_pdf_simple(pdf_path):
+    """
+    增强版 PDF 解析：支持扫描件检测
+    """
     try:
         with pdfplumber.open(pdf_path) as p:
             if not p.pages: return None
             raw = p.pages[0].extract_text()
-            if not raw: return None
+            
+            # --- 检测: 扫描件/纯图片 ---
+            # 如果提取出的字符太少(例如少于10个字)，极大可能是扫描件
+            if not raw or len(raw.strip()) < 10:
+                return {
+                    "发票号码": "", "开票日期": "", "销售方名称": "", "价税合计": 0.0,
+                    "数据来源": "PDF(未识别)", "文件名": os.path.basename(pdf_path),
+                    "备注": "⚠️ 纯图/扫描件，需人工核对"
+                }
+
             text = normalize_text(raw)
             
+            # 1. 发票号码 (20位全电 或 8+位常规)
             num = ""
             m20 = re.search(r'(\d{20})', text)
             if m20: num = m20.group(1)
@@ -114,17 +166,25 @@ def extract_data_from_pdf_simple(pdf_path):
                 m8 = re.search(r'(?:号码|No)[:|]?(\d{8,})', text)
                 if m8: num = m8.group(1)
             
+            # 2. 日期 (兼容 YYYY-MM-DD, YYYY.MM.DD, YYYY年MM月DD日)
             date = ""
             md = re.search(r'(\d{4}[-年/.]\d{1,2}[-月/.]\d{1,2}日?)', text)
-            if md: date = md.group(1)
+            if md: date = format_date(md.group(1))
             
-            amt = find_max_valid_amount(text)
+            # 3. 金额 (使用增强策略)
+            amt = find_best_amount(text)
+            
+            # 4. 销售方
             seller = extract_seller_name_smart(text)
+            
+            status = "正常"
+            if amt == 0: status = "警告:未读到金额"
+            elif not num: status = "警告:无发票号"
             
             return {
                 "发票号码": num, "开票日期": date, "销售方名称": seller,
                 "价税合计": amt, "数据来源": "PDF识别", "文件名": os.path.basename(pdf_path),
-                "备注": "正常" if amt > 0 else "警告:未读到金额"
+                "备注": status
             }
     except: return None
 
@@ -158,8 +218,12 @@ def run_process_pipeline(input_root_dir, output_dir):
         try:
             with pdfplumber.open(pdf) as p:
                 if not p.pages: continue
-                text = normalize_text(p.pages[0].extract_text())
-                amt = find_max_valid_amount(text)
+                # 简单预读取，用于分类
+                raw_text = p.pages[0].extract_text()
+                text = normalize_text(raw_text) if raw_text else ""
+                
+                # 即使是空文本(扫描件)，也先尝试处理，不直接丢弃
+                amt = find_best_amount(text)
                 folder = os.path.dirname(pdf)
                 
                 if is_trip_file(os.path.basename(pdf), text):
@@ -171,7 +235,7 @@ def run_process_pipeline(input_root_dir, output_dir):
     excel_rows = []
     idx = 1
     
-    # 【核对关键】记录哪些原始文件被成功使用了
+    # 【核对关键】记录哪些原始文件被成功使用了 (使用绝对路径)
     processed_source_files = set()
 
     # --- 阶段 A: XML 发票 ---
@@ -192,11 +256,12 @@ def run_process_pipeline(input_root_dir, output_dir):
         folder = os.path.dirname(xml)
         target_pdf = None
         
-        # Scope 匹配
+        # Scope 匹配 (同目录下)
         cands = [p['path'] for p in invoice_pdf_pool if p['folder'] == folder]
         xml_base = os.path.splitext(os.path.basename(xml))[0]
         
         for p in cands:
+            # 文件名包含 xml名 或 发票号
             if xml_base in os.path.basename(p) or (info['num'] and info['num'] in os.path.basename(p)):
                 target_pdf = p
                 break
@@ -208,6 +273,7 @@ def run_process_pipeline(input_root_dir, output_dir):
             matched_trip = None
             trips = [t for t in trip_pool if t['folder'] == folder and not t['used']]
             for t in trips:
+                # 金额匹配
                 if abs(t['amount'] - info['amount']) < 0.05:
                     matched_trip = t
                     t['used'] = True
@@ -235,6 +301,7 @@ def run_process_pipeline(input_root_dir, output_dir):
 
     # --- 阶段 B: 无 XML 的 PDF ---
     for inv in invoice_pdf_pool:
+        # 如果已经被 XML 阶段处理过，跳过
         if os.path.abspath(inv['path']) in processed_source_files: continue
         
         data = extract_data_from_pdf_simple(inv['path'])
@@ -286,6 +353,7 @@ def run_process_pipeline(input_root_dir, output_dir):
     check_exts = ('.pdf', '.xml')
     for f in all_files:
         if f.lower().endswith(check_exts):
+            # 如果文件的绝对路径不在已处理集合中
             if os.path.abspath(f) not in processed_source_files:
                 missing_files.append(f)
 
@@ -297,6 +365,7 @@ def run_process_pipeline(input_root_dir, output_dir):
         for c in cols: 
             if c not in df.columns: df[c] = ""
         df = df[cols]
+        # 强制数值转换
         df['价税合计'] = pd.to_numeric(df['价税合计'], errors='coerce').fillna(0.0)
         sum_row = {"序号": "总计", "价税合计": df['价税合计'].sum(), "销售方名称": f"共 {len(df)} 张"}
         df = pd.concat([df, pd.DataFrame([sum_row])], ignore_index=True)
@@ -315,7 +384,8 @@ def run_manual_check(raw_dir, proc_zip_path, out_dir):
     with zipfile.ZipFile(proc_zip_path, 'r') as z:
         for n in z.namelist():
             base = os.path.basename(n)
-            m = re.search(r'^(\d{8,})', base)
+            # 提取文件名中的长数字
+            m = re.search(r'(\d{8,})', base)
             if m: processed_nums.add(m.group(1))
 
     # 2. 扫描原始文件
@@ -338,9 +408,6 @@ def run_manual_check(raw_dir, proc_zip_path, out_dir):
                     if data: num = data['发票号码']
             except: pass
             
-            # 判断
-            # 如果是行程单(Trip)，且没有被合并(不在zip里体现)，可能无法直接通过文件名判断
-            # 这里主要核对主发票
             if num and num in processed_nums:
                 matched_count += 1
             else:
@@ -362,8 +429,8 @@ def run_manual_check(raw_dir, proc_zip_path, out_dir):
 # ==========================================
 
 def main():
-    st.set_page_config(page_title="发票无忧 V10 (终极版)", layout="wide")
-    st.title("🧾 发票无忧 V10 (含自动核对与遗漏打包)")
+    st.set_page_config(page_title="发票无忧 V11 (终极版)", layout="wide")
+    st.title("🧾 发票无忧 V11 (含自动核对与遗漏打包)")
 
     tab1, tab2 = st.tabs(["🚀 一键处理 (自动核对)", "🔍 手动复核 (旧包审计)"])
 

@@ -19,6 +19,7 @@ def extract_zip_with_encoding(zip_path, extract_to):
     with zipfile.ZipFile(zip_path, 'r') as z:
         for file_info in z.infolist():
             try:
+                # 尝试修复文件名编码 (CP437 -> GBK)
                 if file_info.flag_bits & 0x800 == 0:
                     original_name = file_info.filename.encode('cp437').decode('gbk')
                 else:
@@ -56,40 +57,35 @@ def format_date(date_str):
     return ""
 
 # ==========================================
-# 2. 核心逻辑：文件类型判定与匹配 (重点修复)
+# 2. 核心逻辑：文件类型判定与匹配 (精准控制)
 # ==========================================
 
 def is_trip_file(filename, text=None):
     """
     判断是否为行程单/报销单
-    【修复】：防止行程单因为包含"电子发票"免责声明而被误判为发票
     """
     fn = filename.lower()
     
-    # 1. 文件名特征 (增加 '报销单')
+    # 1. 强特征：文件名包含关键字
     is_trip_name = False
     if "行程" in fn or "trip" in fn or "报销" in fn:
         is_trip_name = True
     
-    # 2. 内容特征检测
+    # 2. 内容特征检测 (防误判)
     if text:
         clean = normalize_text(text)
         
-        # 强特征：如果有发票号码（且为长数字），那它绝对是发票，不是行程单
-        # 匹配 10位以上数字紧跟在"号码"或"No"后面，或者连续20位数字
+        # 核心逻辑：只有当出现明确的 "发票号码+数字" 时，才判定为发票
+        # 排除掉只有"电子发票"四个字但无号码的情况(常见于行程单底部的免责声明)
         has_invoice_num = re.search(r'(?:号码|No|code)[:|]?\d{8,}', clean) or re.search(r'\d{20}', clean)
         
-        # 如果有名为行程单，且没有明确的发票号码，它就是行程单
-        # (即使它里面有 "本单据不作为电子发票" 这样的文字)
         if is_trip_name:
             if not has_invoice_num:
-                return True
+                return True # 文件名像行程单，且无发票号 -> 行程单
             else:
-                # 文件名像行程单，但内容有发票号？可能是"电子发票(行程单).pdf"
-                # 这种情况下，我们把它当发票处理，因为它有号可以进索引
-                return False 
+                return False # 文件名像行程单，但有发票号 -> 视为发票(如"电子发票-行程.pdf")
         
-        # 如果文件名没写行程单，但内容极其像行程单
+        # 文件名不像行程单，但内容像
         if ("行程单" in clean or "triptable" in clean) and not has_invoice_num:
              return True
 
@@ -98,11 +94,11 @@ def is_trip_file(filename, text=None):
 def clean_filename_for_matching(filename):
     """清洗文件名，提取核心特征"""
     name = os.path.splitext(filename)[0]
-    # 去除通用无意义词汇 (增加 '第三方', '网约车' 等)
+    # 扩展清洗词库，确保"第三方网约车..."能匹配"曹操..."
     keywords = [
         "电子发票", "普通发票", "发票", "invoice", 
         "行程报销单", "行程单", "报销单", "行程", "trip", "travel",
-        "滴滴", "出行", "客票", "航空", "机票", "网约车", "服务", "第三方", "公司",
+        "滴滴", "出行", "客票", "航空", "机票", "网约车", "服务", "第三方", "公司", "提供方",
         "copy", "副本", "下载", "download"
     ]
     for k in keywords:
@@ -116,18 +112,20 @@ def is_filename_match(name1, name2):
     c1 = clean_filename_for_matching(name1)
     c2 = clean_filename_for_matching(name2)
     
-    # 如果清洗后这就空了（比如文件名就叫"滴滴出行行程单.pdf"），则无法匹配
+    # 如果清洗后为空(极端情况)，回退到原始包含判断
     if not c1 or not c2: 
-        # 尝试回退到包含关系
         return name1 in name2 or name2 in name1
         
-    # 包含关系或高度相似
+    # 包含关系 或 相似度 > 0.85
     if c1 in c2 or c2 in c1: return True
     return SequenceMatcher(None, c1, c2).ratio() > 0.85
 
 def get_matching_trip_advanced(invoice_amount, invoice_filename, folder, trip_pool):
     """
-    匹配引擎：文件名匹配优先 -> 金额校验 -> 唯一性兜底
+    匹配引擎：
+    1. 优先文件名匹配 (符合用户"一一对应"的直觉)
+    2. 其次金额匹配 (文件名对不上时)
+    3. 最后同包唯一性兜底
     """
     candidates = [t for t in trip_pool if t['folder'] == folder and not t['used']]
     if not candidates: return None, None
@@ -135,16 +133,14 @@ def get_matching_trip_advanced(invoice_amount, invoice_filename, folder, trip_po
     # --- 策略 A: 优先文件名匹配 ---
     for t in candidates:
         if is_filename_match(invoice_filename, os.path.basename(t['path'])):
-            # 找到文件名匹配的，立即校验金额
             trip_amt = t['amount']
             inv_amt = invoice_amount if invoice_amount > 0 else 0
             
-            # 金额校验
+            # 校验金额
             if inv_amt > 0 and trip_amt > 0:
                 if abs(trip_amt - inv_amt) < 0.1:
                     return t, "正常(文件名+金额匹配)"
                 else:
-                    # 即使金额不对，只要文件名高度匹配，也强制合并，但报警
                     return t, f"❌ 金额不符(发票:{inv_amt} vs 行程:{trip_amt}) 需人工复核"
             else:
                 return t, "文件名匹配-金额缺失(需核对)"
@@ -156,7 +152,6 @@ def get_matching_trip_advanced(invoice_amount, invoice_filename, folder, trip_po
                 return t, "金额匹配(文件名不符)"
     
     # --- 策略 C: 同包唯一性兜底 ---
-    # 当前文件夹下只剩1张行程单，且只剩1张发票没匹配（由调用逻辑保证）
     if len(candidates) == 1:
         return candidates[0], "唯一匹配(慎用-需核对)"
 
@@ -204,7 +199,7 @@ def find_amount_strict(text):
         try: amt_up = cn_upper_to_float(up_m.group(1))
         except: pass
     
-    # 2. 小写校验 (增强正则，支持 '合计100.00' 这种紧凑格式)
+    # 2. 小写校验
     lo_m = re.search(r'(?:小写|¥|￥|合计)[^0-9\.]*([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})', text)
     amt_lo = 0.0
     if lo_m:
@@ -213,7 +208,7 @@ def find_amount_strict(text):
             if 0.01 <= v <= 5000000: amt_lo = v
         except: pass
 
-    # 3. 兜底
+    # 3. 兜底 (全文最大值)
     if amt_up == 0 and amt_lo == 0:
         matches = re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', text)
         valid = []
@@ -257,7 +252,6 @@ def extract_data_from_pdf_simple(pdf_path):
         with pdfplumber.open(pdf_path) as p:
             if not p.pages: return None
             raw = p.pages[0].extract_text()
-            # 扫描件检测
             if not raw or len(raw.strip()) < 10: 
                 return {"发票号码":"", "价税合计":0.0, "文件名":os.path.basename(pdf_path), "备注":"⚠️ 纯图/扫描件"}
             
@@ -281,7 +275,7 @@ def extract_data_from_pdf_simple(pdf_path):
     except: return None
 
 # ==========================================
-# 4. 校验引擎
+# 4. 校验引擎 (Verifier) - 仅用于手动核对
 # ==========================================
 
 class InvoiceVerifier:
@@ -304,14 +298,10 @@ class InvoiceVerifier:
         raw_amt = float(raw_info.get('amount') or raw_info.get('价税合计') or 0)
         raw_date = str(raw_info.get('date') or raw_info.get('开票日期') or '').strip()
         
-        # 1. 号码匹配
         if raw_num and len(raw_num) > 6:
             if raw_num in self.processed_nums: return True
-        
-        # 2. 金额+日期匹配
         if raw_amt > 0:
             if (f"{raw_amt:.2f}", raw_date) in self.processed_attrs: return True
-        
         return False
 
 # ==========================================
@@ -334,7 +324,7 @@ def run_process_pipeline(input_root_dir, output_dir):
     trip_pool = []
     invoice_pdf_pool = []
     
-    # 预扫描分类
+    # 预扫描
     for pdf in pdf_files:
         try:
             with pdfplumber.open(pdf) as p:
@@ -342,7 +332,7 @@ def run_process_pipeline(input_root_dir, output_dir):
                 text = normalize_text(p.pages[0].extract_text())
                 amt, _ = find_amount_strict(text)
                 folder = os.path.dirname(pdf)
-                # 使用严格的 is_trip_file 判断
+                # 修复点：行程单判定逻辑增强
                 if is_trip_file(os.path.basename(pdf), text):
                     trip_pool.append({'path': pdf, 'amount': amt, 'folder': folder, 'used': False})
                 else:
@@ -351,6 +341,7 @@ def run_process_pipeline(input_root_dir, output_dir):
 
     excel_rows = []
     idx = 1
+    # 记录所有被"程序触碰过"的文件 (无论是合并了还是归档了)
     processed_source_files = set()
 
     # --- A. XML 处理 ---
@@ -420,8 +411,6 @@ def run_process_pipeline(input_root_dir, output_dir):
                 safe_name = f"{num}_{inv['amount']}.pdf".replace(':','').replace('/','_')
                 merger.write(os.path.join(merged_dir, safe_name)); merger.close()
                 data['备注'] = match_remark
-                # 即使金额不一致，只要匹配了，就保留发票金额（更准确），但备注已高亮
-                # 如果发票没读到金额，用行程单的
                 if data['价税合计'] == 0 and matched_trip['amount'] > 0: data['价税合计'] = matched_trip['amount']
             except:
                 shutil.copy2(inv['path'], os.path.join(noxml_dir, os.path.basename(inv['path'])))
@@ -434,6 +423,7 @@ def run_process_pipeline(input_root_dir, output_dir):
     # --- C. 剩余行程单 ---
     for t in trip_pool:
         if not t['used']:
+            # 修复点：未匹配的行程单也要标记为已处理，因为我们将其归档了
             processed_source_files.add(os.path.abspath(t['path']))
             try: shutil.copy2(t['path'], os.path.join(noxml_dir, os.path.basename(t['path'])))
             except: pass
@@ -454,24 +444,13 @@ def run_process_pipeline(input_root_dir, output_dir):
         excel_path = os.path.join(output_dir, 'Summary_Final.xlsx')
         df_disp.to_excel(excel_path, index=False)
 
+    # 自动核对 (Stage D 修复：使用 processed_source_files 准确判定)
     missing_files = []
-    if not df_result.empty:
-        verifier = InvoiceVerifier(df_result)
-        for f in all_files:
-            if not f.lower().endswith(('.pdf', '.xml')): continue
-            
-            raw_info = None
-            try:
-                if f.lower().endswith('.xml'): raw_info = parse_xml_invoice_data(f)
-                else: raw_info = extract_data_from_pdf_simple(f)
-            except: pass
-            
-            is_missing = True
-            if raw_info:
-                if "纯图" in raw_info.get('备注', ''): is_missing = True
-                elif verifier.check(raw_info): is_missing = False
-            
-            if is_missing: missing_files.append(f)
+    for f in all_files:
+        if not f.lower().endswith(('.pdf', '.xml')): continue
+        # 只要文件在 A/B/C 阶段被记录过，就不算遗漏
+        if os.path.abspath(f) not in processed_source_files:
+            missing_files.append(f)
 
     return excel_path, merged_dir, noxml_dir, missing_files
 
@@ -523,13 +502,13 @@ def run_manual_check(raw_dir, proc_zip_path, out_dir):
 # ==========================================
 
 def main():
-    st.set_page_config(page_title="发票无忧 V15 (终极修复版)", layout="wide")
-    st.title("🧾 发票无忧 V15 (精准修正版)")
+    st.set_page_config(page_title="发票无忧 V16 (修正核对版)", layout="wide")
+    st.title("🧾 发票无忧 V16 (精准核对 + 行程单修复)")
 
     tab1, tab2 = st.tabs(["🚀 一键处理", "🔍 手动复核"])
 
     with tab1:
-        st.info("升级点：1. 修正行程单识别Bug 2. 文件名+金额双重匹配 3. 自动高亮金额不符")
+        st.info("升级点：1. 彻底解决行程单误报缺失 2. 文件名+金额双重匹配 3. 自动高亮金额不符")
         uploaded_files = st.file_uploader("上传文件", type=['zip', 'xml', 'pdf'], accept_multiple_files=True, key="u1")
 
         if uploaded_files and st.button("开始处理", key="b1"):
@@ -574,7 +553,7 @@ def main():
                             st.download_button("📥 下载遗漏包 (Missing.zip)", f, "Missing.zip", type="primary")
 
     with tab2:
-        st.write("反向核对工具")
+        st.write("反向核对工具 (手动复核逻辑保持不变)")
         c1, c2 = st.columns(2)
         raw_ups = c1.file_uploader("1. 上传原始文件", type=['zip','pdf'], accept_multiple_files=True, key="u2")
         proc_zip = c2.file_uploader("2. 上传 Result.zip", type=['zip'], key="u3")
